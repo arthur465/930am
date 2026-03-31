@@ -10,8 +10,25 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── Watchlist (OKX spot symbols) ──────────────────────────────────────────────
-ALL_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+# ── Watchlist ─────────────────────────────────────────────────────────────────
+# Indices & ETFs
+# Stocks
+# Crypto (BTC + ETH hold up best at market open — most correlated with NASDAQ)
+ALL_SYMBOLS = [
+    # Indices / ETFs
+    "SPY",    # S&P 500
+    "QQQ",    # Nasdaq 100
+    "GLD",    # Gold
+
+    # Stocks
+    "TSLA",   # Tesla
+    "AMZN",   # Amazon
+    "GOOGL",  # Google
+
+    # Crypto (trades 24/7 but spikes hard at US market open)
+    "BTC",    # Bitcoin — most correlated with NASDAQ at open
+    "ETH",    # Ethereum — follows BTC, high volume
+]
 
 # ── Strategy timing (Eastern Time) ───────────────────────────────────────────
 OR_START_HOUR, OR_START_MIN = 9, 30
