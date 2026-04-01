@@ -15,7 +15,7 @@ from typing import Dict, Optional
 import pytz
 
 from config import ALL_SYMBOLS, MIN_RR, OR_END_HOUR, OR_END_MIN
-from data.fetcher import get_candles
+from data.cache import get_candles_cached as get_candles, get_cache_stats, invalidate_cache
 from analysis.opening_range import build_opening_range, OpeningRange
 from analysis.bos_detector import detect_bos, BOSResult
 from analysis.fvg_detector import (
@@ -156,8 +156,7 @@ class NitroScanner:
                 )
                 return
 
-            # ── Step 6: RR check ─────────────────────────────────────────────
-            candles_1h = await get_candles(symbol, "1h")
+            # ── Step 6: RR check (reuses candles_1h from step 2 — cache hit) ──────────
             tp = get_1h_tp(candles_1h, current_price, state.bos.direction)
             if tp is None:
                 logger.info(f"{symbol} | Retest confirmed but no 1H TP level found")
