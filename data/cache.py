@@ -1,0 +1,181 @@
+"""
+data/cache.py
+─────────────
+TTL cache + rate limiter for Polygon API calls.
+
+Problem solved:
+    scanner.py calls get_candles() 4-5x per symbol per scan cycle.
+    8 symbols = 32-40 API calls/min → rate limit hell.
+
+Solution:
+    - Cache every response for TTL seconds (default 45s for 1m, 120s for 1h)
+    - Rate limiter: max N calls per minute with token bucket
+    - Duplicate calls within TTL hit cache instantly (0 API calls)
+
+Result:
+    First scan cycle: 1 real call per (symbol, timeframe)
+    Subsequent cycles: 0 calls if within TTL
+    Total real calls per minute: ~8-10 instead of 32-40
+"""
+
+import asyncio
+import logging
+import time
+from typing import Optional
+
+import pandas as pd
+
+logger = logging.getLogger("cache")
+
+# TTL per timeframe — how long a response stays valid (seconds)
+# 1m data: 45s (fresh enough for intrabar scanning)
+# 3m data: 90s
+# 1h data: 120s (rarely changes mid-scan)
+TTL_MAP = {
+    "1m": 45,
+    "3m": 90,
+    "1h": 120,
+}
+DEFAULT_TTL = 60
+
+# Rate limiter — max calls per window
+RATE_LIMIT_CALLS  = 4     # max real API calls per window
+RATE_LIMIT_WINDOW = 12.0  # seconds (= 5 calls/min with headroom)
+
+
+class _CacheEntry:
+    __slots__ = ("data", "expires_at")
+    def __init__(self, data: pd.DataFrame, ttl: float):
+        self.data       = data
+        self.expires_at = time.monotonic() + ttl
+
+    def is_valid(self) -> bool:
+        return time.monotonic() < self.expires_at
+
+
+class CandleCache:
+    """
+    Drop-in cache wrapper around get_candles().
+    Thread/async-safe via asyncio.Lock per key.
+    """
+
+    def __init__(self):
+        self._cache: dict[str, _CacheEntry] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
+
+        # Token bucket rate limiter
+        self._tokens      = float(RATE_LIMIT_CALLS)
+        self._last_refill = time.monotonic()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def get(
+        self,
+        symbol: str,
+        interval: str,
+        fetch_fn,           # the real get_candles coroutine
+        period: str = "1d",
+        force: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Return cached candles if valid, else fetch and cache.
+
+        Args:
+            symbol:   ticker symbol
+            interval: "1m" | "3m" | "1h"
+            fetch_fn: async function(symbol, interval, period) → DataFrame
+            period:   passed through to fetch_fn
+            force:    bypass cache and force a fresh fetch
+        """
+        key = f"{symbol}:{interval}"
+
+        # Per-key lock prevents duplicate in-flight requests
+        async with self._global_lock:
+            if key not in self._locks:
+                self._locks[key] = asyncio.Lock()
+        lock = self._locks[key]
+
+        async with lock:
+            entry = self._cache.get(key)
+            if not force and entry and entry.is_valid():
+                logger.debug(f"[CACHE HIT]  {key}")
+                return entry.data
+
+            # Rate limit before real call
+            await self._wait_for_token(key)
+
+            logger.debug(f"[CACHE MISS] {key} — fetching from API")
+            data = await fetch_fn(symbol, interval, period)
+
+            ttl = TTL_MAP.get(interval, DEFAULT_TTL)
+            self._cache[key] = _CacheEntry(data, ttl)
+            return data
+
+    def invalidate(self, symbol: str = None, interval: str = None):
+        """Manually invalidate cache entries."""
+        if symbol and interval:
+            self._cache.pop(f"{symbol}:{interval}", None)
+        elif symbol:
+            keys = [k for k in self._cache if k.startswith(f"{symbol}:")]
+            for k in keys:
+                self._cache.pop(k, None)
+        else:
+            self._cache.clear()
+
+    def stats(self) -> dict:
+        now = time.monotonic()
+        total  = len(self._cache)
+        valid  = sum(1 for e in self._cache.values() if e.is_valid())
+        return {"total_keys": total, "valid": valid, "expired": total - valid}
+
+    # ── Rate limiter (token bucket) ───────────────────────────────────────────
+
+    async def _wait_for_token(self, key: str):
+        """Block until a rate limit token is available."""
+        while True:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            # Refill tokens proportionally to time passed
+            self._tokens = min(
+                float(RATE_LIMIT_CALLS),
+                self._tokens + elapsed * (RATE_LIMIT_CALLS / RATE_LIMIT_WINDOW)
+            )
+            self._last_refill = now
+
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+
+            wait_time = (1.0 - self._tokens) / (RATE_LIMIT_CALLS / RATE_LIMIT_WINDOW)
+            logger.info(f"[RATE LIMIT] {key} — waiting {wait_time:.1f}s for token")
+            await asyncio.sleep(wait_time + 0.1)
+
+
+# ── Module-level singleton ────────────────────────────────────────────────────
+_cache = CandleCache()
+
+
+async def get_candles_cached(
+    symbol: str,
+    interval: str,
+    period: str = "1d",
+    force: bool = False,
+) -> pd.DataFrame:
+    """
+    Cached drop-in replacement for get_candles().
+    Import this instead of get_candles() in scanner.py.
+
+    Usage:
+        from data.cache import get_candles_cached as get_candles
+    """
+    from data.fetcher import get_candles as _real_fetch
+    return await _cache.get(symbol, interval, _real_fetch, period, force)
+
+
+def get_cache_stats() -> dict:
+    return _cache.stats()
+
+
+def invalidate_cache(symbol: str = None, interval: str = None):
+    _cache.invalidate(symbol, interval)
