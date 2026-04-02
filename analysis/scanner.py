@@ -220,5 +220,9 @@ class NitroScanner:
             if result:
                 record_trade(result)
                 await send_outcome_alert(**result)
+                # Reset alerted flag to allow new setups on this symbol
+                state = self._states[symbol]
+                state.alerted = False
+                logger.info(f"{symbol} | Trade closed — ready for new setups")
         except Exception as e:
             logger.error(f"Trade outcome check error {symbol}: {e}")
