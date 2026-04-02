@@ -28,19 +28,20 @@ import pandas as pd
 logger = logging.getLogger("cache")
 
 # TTL per timeframe — how long a response stays valid (seconds)
-# 1m data: 45s (fresh enough for intrabar scanning)
-# 3m data: 90s
-# 1h data: 120s (rarely changes mid-scan)
+# 1m data: 50s (slightly under 1 candle period)
+# 3m data: 185s (3m candles literally can't change faster — saves huge API budget)
+# 1h data: 300s (rarely changes mid-scan)
 TTL_MAP = {
-    "1m": 45,
-    "3m": 90,
-    "1h": 120,
+    "1m": 50,
+    "3m": 185,
+    "1h": 300,
 }
 DEFAULT_TTL = 60
 
-# Rate limiter — max calls per window
+# Rate limiter — Polygon free tier = 5 calls/minute
+# Using 4/60 to stay safely under with headroom
 RATE_LIMIT_CALLS  = 4     # max real API calls per window
-RATE_LIMIT_WINDOW = 12.0  # seconds (= 5 calls/min with headroom)
+RATE_LIMIT_WINDOW = 60.0  # seconds — THIS was the bug (was 12s = 20/min, not 5/min)
 
 
 class _CacheEntry:
@@ -67,6 +68,10 @@ class CandleCache:
         # Token bucket rate limiter
         self._tokens      = float(RATE_LIMIT_CALLS)
         self._last_refill = time.monotonic()
+
+        # Global 429 backoff — when one call hits rate limit, ALL calls pause
+        self._backoff_until: float = 0.0
+        self._backoff_seconds: float = 15.0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -102,15 +107,33 @@ class CandleCache:
                 logger.debug(f"[CACHE HIT]  {key}")
                 return entry.data
 
+            # Respect global 429 backoff before attempting any real call
+            now = time.monotonic()
+            if now < self._backoff_until:
+                wait = self._backoff_until - now
+                logger.warning(f"[GLOBAL BACKOFF] {key} — waiting {wait:.1f}s (429 cooldown)")
+                await asyncio.sleep(wait)
+
             # Rate limit before real call
             await self._wait_for_token(key)
 
             logger.debug(f"[CACHE MISS] {key} — fetching from API")
             data = await fetch_fn(symbol, interval, period)
 
+            # If fetcher returned empty due to 429, set global backoff and return stale cache
+            if data.empty and entry:
+                logger.warning(f"[CACHE STALE] {key} — using stale data after failed fetch")
+                self._backoff_until = time.monotonic() + self._backoff_seconds
+                return entry.data
+
             ttl = TTL_MAP.get(interval, DEFAULT_TTL)
             self._cache[key] = _CacheEntry(data, ttl)
             return data
+
+    def trigger_backoff(self):
+        """Call this when a 429 is received — pauses all subsequent cache misses."""
+        self._backoff_until = time.monotonic() + self._backoff_seconds
+        logger.warning(f"[GLOBAL BACKOFF SET] All API calls paused for {self._backoff_seconds:.0f}s")
 
     def invalidate(self, symbol: str = None, interval: str = None):
         """Manually invalidate cache entries."""

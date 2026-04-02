@@ -126,8 +126,10 @@ async def get_candles(symbol: str, interval: str, period: str = "1d") -> pd.Data
         if code == 403:
             logger.error(f"Polygon 403 for {ticker} — check API key or plan")
         elif code == 429:
-            logger.warning(f"Polygon rate limited — backing off 12s")
-            await asyncio.sleep(12)
+            logger.warning(f"Polygon 429 for {ticker}/{interval} — triggering global backoff")
+            # Import here to avoid circular import; triggers backoff for ALL pending calls
+            from data.cache import _cache
+            _cache.trigger_backoff()
         else:
             logger.error(f"Polygon HTTP {code} for {ticker}/{interval}")
         return pd.DataFrame()
