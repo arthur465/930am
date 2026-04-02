@@ -61,7 +61,7 @@ class NitroScanner:
 
         for sym in ALL_SYMBOLS:
             await self._scan_symbol(sym, now_et)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.5)  # was 0.3 — needed more gap to stay under rate limit
 
     async def close_session(self):
         """Called at 11am — force close any open paper trades and send stats."""
