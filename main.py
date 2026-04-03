@@ -32,15 +32,12 @@ def _seconds_until_session(now_et: datetime) -> float:
     target = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     if now_et >= target:
         target += timedelta(days=1)
-    # Skip weekends
-    while target.weekday() >= 5:
-        target += timedelta(days=1)
+    # Crypto runs 24/7 - no weekend skip
     return (target - now_et).total_seconds()
 
 
 def _in_session(now_et: datetime) -> bool:
-    if now_et.weekday() >= 5:
-        return False
+    # Crypto runs 24/7 - no weekend restriction
     h, m = now_et.hour, now_et.minute
     after_open  = (h == 9 and m >= 30) or h >= 10
     before_stop = h < SCAN_END_HOUR or (h == SCAN_END_HOUR and m <= SCAN_END_MIN)
@@ -51,7 +48,7 @@ async def main():
     logger.info("=" * 55)
     logger.info("  Nitro BOS + FVG Scanner")
     logger.info("  Entry: FVG retest on 1m or 3m TF")
-    logger.info("  Session: 9:30 – 11:00 AM ET only")
+    logger.info("  Session: 9:30 – 11:00 AM ET (7 days/week)")
     logger.info("=" * 55)
 
     await send_startup()
