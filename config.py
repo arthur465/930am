@@ -11,23 +11,15 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
-# Indices & ETFs
-# Stocks
-# Crypto (BTC + ETH hold up best at market open — most correlated with NASDAQ)
+# Top liquid crypto pairs on OKX
+# These have tight spreads and respond well to US market open volatility
 ALL_SYMBOLS = [
-    # Indices / ETFs
-    "SPY",    # S&P 500
-    "QQQ",    # Nasdaq 100
-    "GLD",    # Gold
-
-    # Stocks
-    "TSLA",   # Tesla
-    "AMZN",   # Amazon
-    "GOOGL",  # Google
-
-    # Crypto (trades 24/7 but spikes hard at US market open)
-    "BTC",    # Bitcoin — most correlated with NASDAQ at open
-    "ETH",    # Ethereum — follows BTC, high volume
+    "BTC/USDT",   # Bitcoin — king, highest volume
+    "ETH/USDT",   # Ethereum — follows BTC, deep liquidity
+    "SOL/USDT",   # Solana — high beta, strong intraday moves
+    "AVAX/USDT",  # Avalanche — good volatility
+    "LINK/USDT",  # Chainlink — solid volume
+    "ARB/USDT",   # Arbitrum — L2 leader, good volume
 ]
 
 # ── Strategy timing (Eastern Time) ───────────────────────────────────────────

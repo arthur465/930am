@@ -89,3 +89,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutdown.")
+        # Clean up OKX connection
+        from data.fetcher import cleanup
+        asyncio.run(cleanup())
