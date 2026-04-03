@@ -156,7 +156,8 @@ class NitroScanner:
                 )
                 return
 
-            # ── Step 6: RR check (reuses candles_1h from step 2 — cache hit) ──────────
+            # ── Step 6: RR check ──────────
+            candles_1h = await get_candles(symbol, "1h")
             tp = get_1h_tp(candles_1h, current_price, state.bos.direction)
             if tp is None:
                 logger.info(f"{symbol} | Retest confirmed but no 1H TP level found")
