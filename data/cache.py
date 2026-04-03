@@ -1,11 +1,11 @@
 """
 data/cache.py
 ─────────────
-TTL cache + rate limiter for Polygon API calls.
+TTL cache + rate limiter for OKX API calls.
 
 Problem solved:
     scanner.py calls get_candles() 4-5x per symbol per scan cycle.
-    8 symbols = 32-40 API calls/min → rate limit hell.
+    6 symbols = 24-30 API calls/min → unnecessary load.
 
 Solution:
     - Cache every response for TTL seconds (default 45s for 1m, 120s for 1h)
@@ -15,7 +15,7 @@ Solution:
 Result:
     First scan cycle: 1 real call per (symbol, timeframe)
     Subsequent cycles: 0 calls if within TTL
-    Total real calls per minute: ~8-10 instead of 32-40
+    Total real calls per minute: ~6-8 instead of 24-30
 """
 
 import asyncio
@@ -38,10 +38,10 @@ TTL_MAP = {
 }
 DEFAULT_TTL = 60
 
-# Rate limiter — Polygon free tier = 5 calls/minute
-# Using 4/60 to stay safely under with headroom
-RATE_LIMIT_CALLS  = 4     # max real API calls per window
-RATE_LIMIT_WINDOW = 60.0  # seconds — THIS was the bug (was 12s = 20/min, not 5/min)
+# Rate limiter — OKX public endpoints = 20 calls per 2s = 600/min
+# Using 30/60 to stay safely under with plenty of headroom
+RATE_LIMIT_CALLS  = 30    # max real API calls per window
+RATE_LIMIT_WINDOW = 60.0  # seconds
 
 
 class _CacheEntry:
