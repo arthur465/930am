@@ -10,6 +10,10 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ── Coinalyze API (for enhanced execution data) ──────────────────────────────
+COINALYZE_API_KEY = os.getenv("COINALYZE_API_KEY", "")
+COINALYZE_EXCHANGE = os.getenv("COINALYZE_EXCHANGE", "binance")  # binance, okx, bybit, coinbase
+
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 # Top liquid crypto pairs on OKX
 # These have tight spreads and respond well to US market open volatility
