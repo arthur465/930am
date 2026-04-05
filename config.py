@@ -15,15 +15,11 @@ COINALYZE_API_KEY = os.getenv("COINALYZE_API_KEY", "")
 COINALYZE_EXCHANGE = os.getenv("COINALYZE_EXCHANGE", "binance")  # binance, okx, bybit, coinbase
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
-# Top liquid crypto pairs on OKX
-# These have tight spreads and respond well to US market open volatility
+# Focus on top 2 most liquid pairs for best execution and minimal rate limit issues
+# BTC and ETH have deepest liquidity and respond best to US market open volatility
 ALL_SYMBOLS = [
-    "BTC/USDT",   # Bitcoin — king, highest volume
+    "BTC/USDT",   # Bitcoin — king, highest volume, tightest spreads
     "ETH/USDT",   # Ethereum — follows BTC, deep liquidity
-    "SOL/USDT",   # Solana — high beta, strong intraday moves
-    "AVAX/USDT",  # Avalanche — good volatility
-    "LINK/USDT",  # Chainlink — solid volume
-    "ARB/USDT",   # Arbitrum — L2 leader, good volume
 ]
 
 # ── Strategy timing (Eastern Time) ───────────────────────────────────────────
@@ -55,4 +51,4 @@ MIN_RR = 1.5
 PAPER_TRADE_SIZE_USDT = float(os.getenv("PAPER_TRADE_SIZE_USDT", "100"))
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
-SCAN_INTERVAL_SECONDS = 60   # scan every 60s during session
+SCAN_INTERVAL_SECONDS = 90   # scan every 90s (was 60s - reduced to ease API pressure)
