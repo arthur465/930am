@@ -20,11 +20,11 @@ logger = logging.getLogger("fetcher")
 ET     = pytz.timezone("America/New_York")
 UTC    = pytz.utc
 
-# Interval mapping for ccxt (OKX uses: 1m, 3m, 5m, 15m, 1H, 4H, 1D)
+# Interval mapping for ccxt (OKX uses: 1m, 3m, 5m, 15m, 1h, 4h, 1d)
 INTERVAL_MAP = {
     "1m": "1m",
     "3m": "3m",
-    "1h": "1H",
+    "1h": "1h",  # FIXED: OKX uses lowercase 'h'
 }
 
 # How many bars to fetch per interval
@@ -89,7 +89,10 @@ async def get_candles(symbol: str, interval: str, period: str = "1d") -> pd.Data
         return df
 
     except ccxt.RateLimitExceeded:
-        logger.warning(f"OKX rate limit for {symbol}/{interval} — will retry next scan")
+        logger.warning(f"OKX rate limit for {symbol}/{interval} — triggering global backoff")
+        # Notify cache to back off ALL requests
+        from data.cache import _cache
+        _cache.trigger_backoff()
         return pd.DataFrame()
 
     except ccxt.NetworkError as e:

@@ -38,10 +38,14 @@ TTL_MAP = {
 }
 DEFAULT_TTL = 60
 
-# Rate limiter — OKX public endpoints = 20 calls per 2s = 600/min
-# Using 30/60 to stay safely under with plenty of headroom
-RATE_LIMIT_CALLS  = 30    # max real API calls per window
+# Rate limiter — OKX public endpoints have varying limits per endpoint
+# Conservative: 15 calls per 60s to stay well under any limit
+# Original was 30/60 but still hitting 429s
+RATE_LIMIT_CALLS  = 15    # max real API calls per window (reduced from 30)
 RATE_LIMIT_WINDOW = 60.0  # seconds
+
+# Increased backoff when we DO hit 429
+BACKOFF_SECONDS = 30.0  # wait 30s instead of 15s after 429
 
 
 class _CacheEntry:
@@ -71,7 +75,7 @@ class CandleCache:
 
         # Global 429 backoff — when one call hits rate limit, ALL calls pause
         self._backoff_until: float = 0.0
-        self._backoff_seconds: float = 15.0
+        self._backoff_seconds: float = BACKOFF_SECONDS
 
     # ── Public API ────────────────────────────────────────────────────────────
 
