@@ -1,32 +1,21 @@
 """
 execution/stats_tracker.py
-───────────────────────────
 Collects trade results, calculates win rate + total R.
 Persists to stats.json so data survives restarts.
 """
-
 import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger("stats")
-
 STATS_FILE = os.path.join(os.path.dirname(__file__), "..", "stats.json")
 
 
 def _empty_stats() -> dict:
     return {
-        "trades":    [],
-        "total":     0,
-        "wins":      0,
-        "losses":    0,
-        "expired":   0,
-        "total_r":   0.0,
-        "win_rate":  0.0,
-        "avg_r":     0.0,
-        "last_updated": "",
+        "trades": [], "total": 0, "wins": 0, "losses": 0, "expired": 0,
+        "total_r": 0.0, "win_rate": 0.0, "avg_r": 0.0, "last_updated": "",
     }
 
 
@@ -50,16 +39,10 @@ def _save(stats: dict):
 
 
 def record_trade(close_result: dict):
-    """Call after every trade close. Updates persistent stats."""
     stats = _load()
-
-    stats["trades"].append({
-        **close_result,
-        "closed_at": datetime.now(timezone.utc).isoformat(),
-    })
-
+    stats["trades"].append({**close_result, "closed_at": datetime.now(timezone.utc).isoformat()})
     stats["total"]   += 1
-    stats["total_r"] = round(stats["total_r"] + close_result["r_mult"], 2)
+    stats["total_r"]  = round(stats["total_r"] + close_result["r_mult"], 2)
 
     outcome = close_result["outcome"]
     if outcome == "win":
@@ -69,16 +52,14 @@ def record_trade(close_result: dict):
     else:
         stats["expired"] += 1
 
-    decided = stats["wins"] + stats["losses"]
+    decided         = stats["wins"] + stats["losses"]
     stats["win_rate"] = round((stats["wins"] / decided * 100) if decided > 0 else 0.0, 1)
     stats["avg_r"]    = round((stats["total_r"] / stats["total"]) if stats["total"] > 0 else 0.0, 2)
 
     _save(stats)
     logger.info(
-        f"[stats] {stats['total']} trades | "
-        f"WR={stats['win_rate']}% | "
-        f"Total R={stats['total_r']:+.2f} | "
-        f"Avg={stats['avg_r']:+.2f}R"
+        f"[stats] {stats['total']} trades | WR={stats['win_rate']}% | "
+        f"Total R={stats['total_r']:+.2f} | Avg={stats['avg_r']:+.2f}R"
     )
 
 
@@ -99,15 +80,13 @@ def format_summary() -> str:
         f"Avg R:    {s['avg_r']:+.2f}R per trade",
     ]
 
-    # Last 5 trades
     recent = s["trades"][-5:]
     if recent:
         lines.append("\n<b>Last 5 trades:</b>")
         for t in reversed(recent):
             emoji = {"win": "🎯", "loss": "🛑", "expired": "⏰"}[t["outcome"]]
             lines.append(
-                f"{emoji} {t['symbol']} {t['direction'].upper()} "
-                f"{t['r_mult']:+.2f}R ({t['fvg_tf']} FVG)"
+                f"{emoji} {t['symbol']} {t['direction'].upper()} {t['r_mult']:+.2f}R"
             )
 
     return "\n".join(lines)
