@@ -1,7 +1,8 @@
 """
-Nitro BOS+FVG Scanner — Main
-Strategy: Opening Range → BOS → FVG retest (1m/3m) → Paper Trade
-Session:  9:30–11:00 AM ET only. Sleeps outside that window.
+Nitro BOS Scanner — Main
+Strategy: OR (9:30–9:40) → Volatility → BOS → Enter immediately
+Assets:   AAPL, GOOGL, AMZN, TSLA, NVDA, SPY, QQQ, BTC, ETH
+Session:  9:30 – 11:00 AM ET (stocks: Mon–Fri only via yfinance; crypto: daily)
 """
 import asyncio
 import logging
@@ -25,19 +26,13 @@ ET = pytz.timezone("America/New_York")
 
 
 def _seconds_until_session(now_et: datetime) -> float:
-    """
-    Returns seconds until next 9:30 AM ET session open.
-    If we're already past 11am, sleep until 9:30 tomorrow.
-    """
     target = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     if now_et >= target:
         target += timedelta(days=1)
-    # Crypto runs 24/7 - no weekend skip
     return (target - now_et).total_seconds()
 
 
 def _in_session(now_et: datetime) -> bool:
-    # Crypto runs 24/7 - no weekend restriction
     h, m = now_et.hour, now_et.minute
     after_open  = (h == 9 and m >= 30) or h >= 10
     before_stop = h < SCAN_END_HOUR or (h == SCAN_END_HOUR and m <= SCAN_END_MIN)
@@ -46,13 +41,14 @@ def _in_session(now_et: datetime) -> bool:
 
 async def main():
     logger.info("=" * 55)
-    logger.info("  Nitro BOS + FVG Scanner")
-    logger.info("  Entry: FVG retest on 1m or 3m TF")
-    logger.info("  Session: 9:30 – 11:00 AM ET (7 days/week)")
+    logger.info("  Nitro BOS Scanner")
+    logger.info("  Strategy: OR → Vol → BOS → Enter (no FVG)")
+    logger.info("  Assets: AAPL GOOGL AMZN TSLA NVDA SPY QQQ BTC ETH")
+    logger.info("  Session: 9:30 – 11:00 AM ET")
     logger.info("=" * 55)
 
     await send_startup()
-    scanner = NitroScanner()
+    scanner       = NitroScanner()
     session_closed = False
 
     while True:
@@ -65,19 +61,16 @@ async def main():
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
         else:
-            # Session just ended — close trades, send stats, then sleep
             if not session_closed:
                 logger.info("Session ended — closing trades + sending stats")
                 await scanner.close_session()
-                summary = format_summary()
-                logger.info(f"\n{summary}")
+                logger.info(f"\n{format_summary()}")
                 session_closed = True
 
-            secs = _seconds_until_session(now_et)
+            secs  = _seconds_until_session(now_et)
             hours = int(secs // 3600)
             mins  = int((secs % 3600) // 60)
             logger.info(f"Outside session — sleeping {hours}h {mins}m until next open")
-            # Sleep in chunks so we wake up right at 9:30
             await asyncio.sleep(min(secs, 60))
 
 
@@ -86,8 +79,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutdown.")
-        # Clean up connections
-        from data.fetcher import cleanup as cleanup_okx
+        from data.fetcher import cleanup as cleanup_fetcher
         from data.coinalyze_fetcher import cleanup as cleanup_coinalyze
-        asyncio.run(cleanup_okx())
+        asyncio.run(cleanup_fetcher())
         asyncio.run(cleanup_coinalyze())
