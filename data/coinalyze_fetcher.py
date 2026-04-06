@@ -1,331 +1,246 @@
 """
 data/coinalyze_fetcher.py
 ──────────────────────────
-Fetches high-quality candlestick data from Coinalyze API.
-Used for precise trade execution tracking (entry/exit points).
+Coinalyze API client.
 
-Coinalyze provides professional-grade OHLCV data with:
-  - Better data quality than free exchange APIs
-  - Accurate tick-level precision
-  - Buy/sell volume breakdown for order flow analysis
-  - Clean, reliable candles
+Used for:
+  1. Crypto OHLCV candles with buy/sell volume breakdown
+     (higher quality than free exchange APIs)
+  2. CVD confirmation on BOS candle
+     (buy ratio > threshold on long BOS, < threshold on short BOS)
 
-API Docs: https://api.coinalyze.net/v1/doc/
+API docs: https://api.coinalyze.net/v1/doc/
+Rate limit: 40 calls / minute (free tier)
 """
 
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Tuple
 
 import aiohttp
 import pandas as pd
 import pytz
 
-from config import COINALYZE_API_KEY, COINALYZE_EXCHANGE
+from config import COINALYZE_API_KEY, COINALYZE_EXCHANGE, CVD_MIN_RATIO
 
 logger = logging.getLogger("coinalyze")
-ET = pytz.timezone("America/New_York")
+ET  = pytz.timezone("America/New_York")
 UTC = pytz.utc
 
-# Coinalyze API base URL
 BASE_URL = "https://api.coinalyze.net/v1"
 
-# Symbol mapping: OKX format -> Coinalyze symbol format
-# Format: SYMBOL_PERP.EXCHANGE or SYMBOL.EXCHANGE
-# Examples: BTCUSDT_PERP.A (Binance futures), BTCUSDT.A (Binance spot)
 SYMBOL_MAP = {
     "BTC/USDT": "BTCUSDT",
-    "ETH/USDT": "ETHUSDT", 
-    "SOL/USDT": "SOLUSDT",
-    "AVAX/USDT": "AVAXUSDT",
-    "LINK/USDT": "LINKUSDT",
-    "ARB/USDT": "ARBUSDT",
+    "ETH/USDT": "ETHUSDT",
 }
 
-# Exchange codes (from /v1/exchanges endpoint)
 EXCHANGE_MAP = {
-    "binance": "A",
-    "okx": "0",
-    "bybit": "1",
+    "binance":  "A",
+    "okx":      "0",
+    "bybit":    "1",
     "coinbase": "C",
 }
 
-# Interval mapping (Coinalyze uses: 1min, 5min, 15min, 30min, 1hour, 2hour, 4hour, 6hour, 12hour, daily)
 INTERVAL_MAP = {
     "1m": "1min",
-    "3m": "1min",  # Coinalyze doesn't have 3m, use 1m and aggregate if needed
-    "5m": "5min",
-    "15m": "15min",
     "1h": "1hour",
 }
 
-# Rate limit: 40 calls per minute
-_rate_limiter = None
+# Lookback sizes
+LOOKBACK_MAP = {
+    "1m": 120,   # 2 hours of 1m bars
+    "1h": 48,    # 48 hours of 1h bars
+}
+
 _session: Optional[aiohttp.ClientSession] = None
-
-
-class RateLimiter:
-    """Simple rate limiter for Coinalyze API (40 calls/min)."""
-    
-    def __init__(self, calls_per_minute: int = 40):
-        self.calls_per_minute = calls_per_minute
-        self.semaphore = asyncio.Semaphore(calls_per_minute)
-        self.reset_task = None
-        
-    async def start(self):
-        """Start the rate limiter reset loop."""
-        self.reset_task = asyncio.create_task(self._reset_loop())
-        
-    async def _reset_loop(self):
-        """Reset semaphore every minute."""
-        while True:
-            await asyncio.sleep(60)
-            # Release all permits
-            for _ in range(self.calls_per_minute):
-                try:
-                    self.semaphore.release()
-                except ValueError:
-                    break
-                    
-    async def acquire(self):
-        """Acquire a permit to make an API call."""
-        await self.semaphore.acquire()
-        
-    async def stop(self):
-        """Stop the rate limiter."""
-        if self.reset_task:
-            self.reset_task.cancel()
-            try:
-                await self.reset_task
-            except asyncio.CancelledError:
-                pass
+_rate_sem: Optional[asyncio.Semaphore]    = None
+_reset_task: Optional[asyncio.Task]       = None
 
 
 def _get_session() -> aiohttp.ClientSession:
-    """Get or create aiohttp session."""
     global _session
     if _session is None or _session.closed:
         _session = aiohttp.ClientSession()
     return _session
 
 
-async def _get_rate_limiter() -> RateLimiter:
-    """Get or create rate limiter."""
-    global _rate_limiter
-    if _rate_limiter is None:
-        _rate_limiter = RateLimiter(calls_per_minute=40)
-        await _rate_limiter.start()
-    return _rate_limiter
+async def _get_sem() -> asyncio.Semaphore:
+    global _rate_sem, _reset_task
+    if _rate_sem is None:
+        _rate_sem   = asyncio.Semaphore(40)
+        _reset_task = asyncio.create_task(_sem_reset_loop())
+    return _rate_sem
 
 
-def _build_symbol(base_symbol: str, is_futures: bool = True) -> str:
-    """
-    Convert OKX symbol format to Coinalyze format.
-    
-    Args:
-        base_symbol: Symbol in OKX format (e.g., "BTC/USDT")
-        is_futures: True for futures (_PERP suffix), False for spot
-    
-    Returns:
-        Coinalyze symbol format (e.g., "BTCUSDT_PERP.A")
-    """
-    base = SYMBOL_MAP.get(base_symbol, base_symbol.replace("/", ""))
-    exchange_code = EXCHANGE_MAP.get(COINALYZE_EXCHANGE, "A")
-    
-    if is_futures:
-        return f"{base}_PERP.{exchange_code}"
-    else:
-        return f"{base}.{exchange_code}"
+async def _sem_reset_loop():
+    while True:
+        await asyncio.sleep(60)
+        if _rate_sem:
+            for _ in range(40):
+                try:
+                    _rate_sem.release()
+                except ValueError:
+                    break
 
 
-async def get_execution_candles(
-    symbol: str,
-    interval: str,
-    lookback_minutes: int = 10,
-    is_futures: bool = True,
-) -> pd.DataFrame:
-    """
-    Fetch recent high-quality OHLCV candles for trade execution analysis.
-    
-    Args:
-        symbol: Symbol in OKX format (e.g., "BTC/USDT")
-        interval: Timeframe (1m, 5m, 15m, 1h)
-        lookback_minutes: How many minutes of data to fetch
-        is_futures: True for futures market, False for spot
-    
-    Returns:
-        DataFrame with columns: Open, High, Low, Close, Volume, BuyVolume, Trades, BuyTrades
-        Index is ET-aware datetime
-    """
+def _build_symbol(base: str, futures: bool = True) -> str:
+    code     = SYMBOL_MAP.get(base, base.replace("/", ""))
+    exch     = EXCHANGE_MAP.get(COINALYZE_EXCHANGE, "A")
+    suffix   = "_PERP" if futures else ""
+    return f"{code}{suffix}.{exch}"
+
+
+async def _fetch(endpoint: str, params: dict) -> Optional[list]:
+    """Raw GET helper. Returns parsed JSON list or None on error."""
     if not COINALYZE_API_KEY:
-        logger.warning("COINALYZE_API_KEY not set — skipping enhanced execution data")
-        return pd.DataFrame()
-    
-    if interval not in INTERVAL_MAP:
-        logger.warning(f"Unsupported interval: {interval}")
-        return pd.DataFrame()
-    
-    coinalyze_symbol = _build_symbol(symbol, is_futures)
-    coinalyze_interval = INTERVAL_MAP[interval]
-    
-    # Calculate time range
-    now = datetime.now(UTC)
-    from_time = now - timedelta(minutes=lookback_minutes)
-    
-    # Convert to UNIX timestamps (seconds)
-    from_ts = int(from_time.timestamp())
-    to_ts = int(now.timestamp())
-    
+        return None
+
+    sem = await _get_sem()
+    await sem.acquire()
+
+    session = _get_session()
+    url     = f"{BASE_URL}/{endpoint}"
+    params  = {"api_key": COINALYZE_API_KEY, **params}
+
     try:
-        # Rate limiting
-        limiter = await _get_rate_limiter()
-        await limiter.acquire()
-        
-        # Make API request
-        session = _get_session()
-        url = f"{BASE_URL}/ohlcv-history"
-        params = {
-            "api_key": COINALYZE_API_KEY,
-            "symbols": coinalyze_symbol,
-            "interval": coinalyze_interval,
-            "from": from_ts,
-            "to": to_ts,
-        }
-        
-        async with session.get(url, params=params) as response:
-            if response.status == 429:
-                # Rate limit hit
-                retry_after = int(response.headers.get("Retry-After", 60))
-                logger.warning(f"Coinalyze rate limit — retry after {retry_after}s")
-                await asyncio.sleep(retry_after)
-                return pd.DataFrame()
-            
-            if response.status == 401:
-                logger.error("Coinalyze: Invalid API key")
-                return pd.DataFrame()
-            
-            if response.status != 200:
-                logger.error(f"Coinalyze API error: {response.status}")
-                return pd.DataFrame()
-            
-            data = await response.json()
-            
-            if not data or len(data) == 0:
-                logger.warning(f"Coinalyze: No data for {coinalyze_symbol}/{coinalyze_interval}")
-                return pd.DataFrame()
-            
-            # Parse response: [{"symbol": "...", "history": [{t, o, h, l, c, v, bv, tx, btx}, ...]}]
-            symbol_data = data[0]
-            history = symbol_data.get("history", [])
-            
-            if not history:
-                return pd.DataFrame()
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(history)
-            
-            # Rename columns to match our standard format
-            df = df.rename(columns={
-                "t": "ts",
-                "o": "Open",
-                "h": "High", 
-                "l": "Low",
-                "c": "Close",
-                "v": "Volume",
-                "bv": "BuyVolume",
-                "tx": "Trades",
-                "btx": "BuyTrades",
-            })
-            
-            # Convert timestamp to datetime
-            df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True)
-            df = df.set_index("ts")
-            df.index = df.index.tz_convert(ET)
-            
-            # Ensure numeric types
-            numeric_cols = ["Open", "High", "Low", "Close", "Volume", "BuyVolume", "Trades", "BuyTrades"]
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            
-            df = df.dropna()
-            
-            logger.debug(f"Coinalyze: {coinalyze_symbol}/{coinalyze_interval} → {len(df)} bars")
-            return df
-    
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 429:
+                retry = int(r.headers.get("Retry-After", 60))
+                logger.warning(f"Coinalyze 429 — retry after {retry}s")
+                await asyncio.sleep(retry)
+                return None
+            if r.status == 401:
+                logger.error("Coinalyze: invalid API key")
+                return None
+            if r.status != 200:
+                logger.error(f"Coinalyze {r.status} on {endpoint}")
+                return None
+            return await r.json()
     except aiohttp.ClientError as e:
         logger.error(f"Coinalyze network error: {e}")
-        return pd.DataFrame()
-    
+        return None
     except Exception as e:
         logger.error(f"Coinalyze fetch error: {e}", exc_info=True)
+        return None
+
+
+# ── Public: OHLCV ─────────────────────────────────────────────────────────────
+
+async def get_candles_crypto(symbol: str, interval: str, futures: bool = True) -> pd.DataFrame:
+    """
+    Fetch OHLCV + buy/sell volume from Coinalyze.
+    Returns ET-indexed DataFrame with columns:
+      Open, High, Low, Close, Volume, BuyVolume, Trades, BuyTrades
+    Falls back to empty DataFrame if key not set or error.
+    """
+    if not COINALYZE_API_KEY:
         return pd.DataFrame()
 
+    if interval not in INTERVAL_MAP:
+        return pd.DataFrame()
 
-async def get_trade_context(
+    coinalyze_sym      = _build_symbol(symbol, futures)
+    coinalyze_interval = INTERVAL_MAP[interval]
+    lookback           = LOOKBACK_MAP.get(interval, 120)
+
+    now      = datetime.now(UTC)
+    from_ts  = int((now - timedelta(minutes=lookback)).timestamp())
+    to_ts    = int(now.timestamp())
+
+    data = await _fetch("ohlcv-history", {
+        "symbols":  coinalyze_sym,
+        "interval": coinalyze_interval,
+        "from":     from_ts,
+        "to":       to_ts,
+    })
+
+    if not data:
+        return pd.DataFrame()
+
+    history = data[0].get("history", []) if data else []
+    if not history:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(history).rename(columns={
+        "t": "ts", "o": "Open", "h": "High", "l": "Low",
+        "c": "Close", "v": "Volume", "bv": "BuyVolume",
+        "tx": "Trades", "btx": "BuyTrades",
+    })
+
+    df["ts"]    = pd.to_datetime(df["ts"], unit="s", utc=True)
+    df          = df.set_index("ts")
+    df.index    = df.index.tz_convert(ET)
+
+    num_cols = [c for c in ["Open", "High", "Low", "Close", "Volume", "BuyVolume", "Trades", "BuyTrades"]
+                if c in df.columns]
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+    df           = df.dropna(subset=["Open", "High", "Low", "Close"])
+
+    logger.debug(f"Coinalyze {coinalyze_sym}/{coinalyze_interval} → {len(df)} bars")
+    return df
+
+
+# ── Public: CVD Confirmation ───────────────────────────────────────────────────
+
+async def get_cvd_confirmation(
     symbol: str,
-    entry_time: datetime,
-    lookback_minutes: int = 5,
-    is_futures: bool = True,
-) -> Optional[Dict[str, Any]]:
+    direction: str,
+    bos_candle_time,       # pd.Timestamp or datetime
+    futures: bool = True,
+) -> Tuple[bool, float]:
     """
-    Get detailed market context around a trade entry using Coinalyze data.
-    
-    Returns dict with:
-        - entry_candle: The candle where trade was entered
-        - buy_sell_ratio: Ratio of buy volume to total volume
-        - avg_trade_size: Average trade size
-        - recent_candles: Last N candles for context
-    """
-    df = await get_execution_candles(
-        symbol=symbol,
-        interval="1m",
-        lookback_minutes=lookback_minutes,
-        is_futures=is_futures,
-    )
-    
-    if df.empty:
-        return None
-    
-    # Find the candle closest to entry time
-    entry_time_et = entry_time.astimezone(ET) if entry_time.tzinfo else ET.localize(entry_time)
-    
-    # Get candles around entry
-    mask = df.index <= entry_time_et
-    if not mask.any():
-        return None
-    
-    entry_candle = df[mask].iloc[-1]
-    
-    # Calculate buy/sell metrics
-    total_vol = float(entry_candle["Volume"]) if entry_candle["Volume"] > 0 else 1.0
-    buy_vol = float(entry_candle.get("BuyVolume", 0))
-    buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
-    
-    # Calculate average trade size
-    total_trades = float(entry_candle.get("Trades", 0))
-    avg_size = total_vol / total_trades if total_trades > 0 else 0
-    
-    return {
-        "entry_candle": entry_candle.to_dict(),
-        "buy_sell_ratio": buy_ratio,
-        "avg_trade_size": avg_size,
-        "total_volume": total_vol,
-        "buy_volume": buy_vol,
-        "sell_volume": total_vol - buy_vol,
-        "recent_candles": df.tail(5).to_dict("records"),
-    }
+    Check buy/sell ratio on the BOS candle via Coinalyze.
 
+    Returns:
+        (confirmed: bool, buy_ratio: float)
+        confirmed = True if order flow aligns with the BOS direction.
+        Falls back to (True, 0.5) if no data (pass-through).
+    """
+    if not COINALYZE_API_KEY or CVD_MIN_RATIO <= 0:
+        return True, 0.5
+
+    df = await get_candles_crypto(symbol, "1m", futures)
+    if df.empty or "BuyVolume" not in df.columns:
+        return True, 0.5
+
+    # Find the BOS candle or the one right after it
+    try:
+        post = df[df.index >= bos_candle_time]
+        candle = post.iloc[0] if not post.empty else df.iloc[-1]
+    except Exception:
+        return True, 0.5
+
+    total_vol = float(candle["Volume"]) or 1.0
+    buy_vol   = float(candle.get("BuyVolume", 0))
+    ratio     = buy_vol / total_vol
+
+    if direction == "long":
+        confirmed = ratio >= CVD_MIN_RATIO
+    else:
+        confirmed = ratio <= (1.0 - CVD_MIN_RATIO)
+
+    logger.info(
+        f"CVD confirm {symbol} {direction}: buy_ratio={ratio:.3f} "
+        f"threshold={'≥' if direction == 'long' else '≤'}"
+        f"{CVD_MIN_RATIO if direction == 'long' else 1-CVD_MIN_RATIO:.2f} "
+        f"→ {'✅' if confirmed else '❌'}"
+    )
+    return confirmed, round(ratio, 3)
+
+
+# ── Cleanup ────────────────────────────────────────────────────────────────────
 
 async def cleanup():
-    """Close aiohttp session and stop rate limiter."""
-    global _session, _rate_limiter
-    
-    if _rate_limiter:
-        await _rate_limiter.stop()
-        _rate_limiter = None
-    
+    global _session, _rate_sem, _reset_task
+    if _reset_task:
+        _reset_task.cancel()
+        try:
+            await _reset_task
+        except asyncio.CancelledError:
+            pass
+        _reset_task = None
+    _rate_sem = None
     if _session and not _session.closed:
         await _session.close()
         _session = None
