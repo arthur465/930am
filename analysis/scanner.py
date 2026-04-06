@@ -1,10 +1,19 @@
 """
 analysis/scanner.py
 ────────────────────
-Per-symbol state machine. Runs through each step in order:
-  Volatility → OR → BOS → FVG → Retest → RR → Alert → Paper Trade → Track
+Per-symbol state machine — simplified for direct BOS entry.
 
-Entry executes on the FVG retest, on whatever TF the best FVG was found (3m > 1m).
+Flow per symbol each scan cycle:
+  1. Build OR (9:30–9:39 candles)
+  2. Wait for 9:40 OR window to close
+  3. Volatility check (OR range + ATR)
+  4. Detect BOS (first strong 1m close above/below OR H/L)
+  5. [Crypto only] Coinalyze CVD confirmation
+  6. Enter at BOS close price
+     - SL = just inside the broken OR boundary
+     - TP = TARGET_R × risk (1.5R)
+     - 1H swing level shown in alert as reference
+  7. Track trade outcome (TP / SL hit)
 """
 import asyncio
 import logging
@@ -14,14 +23,15 @@ from typing import Dict, Optional
 
 import pytz
 
-from config import ALL_SYMBOLS, MIN_RR, OR_END_HOUR, OR_END_MIN
-from data.cache import get_candles_cached as get_candles, get_cache_stats, invalidate_cache
+from config import (
+    ALL_SYMBOLS, TARGET_R, SL_BUFFER_PCT,
+    OR_END_HOUR, OR_END_MIN,
+)
+from data.cache import get_candles_cached as get_candles
+from data.fetcher import is_crypto
 from analysis.opening_range import build_opening_range, OpeningRange
 from analysis.bos_detector import detect_bos, BOSResult
-from analysis.fvg_detector import (
-    find_fvgs, get_best_fvg, FVG,
-    is_retesting, get_1h_tp, calculate_rr,
-)
+from analysis.levels import get_1h_swing_level
 from analysis.volatility import or_range_is_valid, atr_is_valid
 from execution.paper_trader import PaperTrader
 from execution.stats_tracker import record_trade, format_summary
@@ -35,7 +45,6 @@ ET = pytz.timezone("America/New_York")
 class SymbolState:
     opening_range: Optional[OpeningRange] = None
     bos:           Optional[BOSResult]    = None
-    active_fvg:    Optional[FVG]          = None
     alerted:       bool                   = False
     skipped_vol:   bool                   = False
 
@@ -58,21 +67,18 @@ class NitroScanner:
     async def scan(self):
         self._reset_if_new_day()
         now_et = datetime.now(ET)
-
         for sym in ALL_SYMBOLS:
             await self._scan_symbol(sym, now_et)
-            await asyncio.sleep(1.5)  # was 0.3 — needed more gap to stay under rate limit
+            await asyncio.sleep(1.0)
 
     async def close_session(self):
-        """Called at 11am — force close any open paper trades and send stats."""
-        logger.info("Session ending — closing all open trades")
-        # get latest price for each symbol to close at market
+        """Called at session end — force-close open paper trades and send stats."""
         for sym in ALL_SYMBOLS:
             if self._paper.already_in_trade(sym):
                 try:
                     candles = await get_candles(sym, "1m")
                     if not candles.empty:
-                        price = float(candles["Close"].iloc[-1])
+                        price   = float(candles["Close"].iloc[-1])
                         results = self._paper.force_close_all(price)
                         for r in results:
                             record_trade(r)
@@ -83,11 +89,13 @@ class NitroScanner:
         summary = format_summary()
         await send_stats(summary)
 
+    # ── Per-symbol state machine ───────────────────────────────────────────────
+
     async def _scan_symbol(self, symbol: str, now_et: datetime):
         state = self._states[symbol]
 
+        # Already fired alert or failed vol — just monitor open trade if any
         if state.alerted or state.skipped_vol:
-            # Still check open trades for TP/SL even after alert fired
             await self._check_trade_outcome(symbol)
             return
 
@@ -96,26 +104,26 @@ class NitroScanner:
             if candles_1m.empty:
                 return
 
-            # ── Step 1: Build opening range (9:30–9:39) ─────────────────────
+            # ── Step 1: Build OR (9:30–9:39) ─────────────────────────────────
             if state.opening_range is None:
                 result = build_opening_range(candles_1m)
                 if result:
                     state.opening_range = result
-                    logger.info(f"{symbol} | OR built: H={result.high:.2f}  L={result.low:.2f}")
+                    logger.info(f"{symbol} | OR built: H={result.high:.4f}  L={result.low:.4f}")
                 return
 
-            # ── Wait for OR window to close (9:40) ──────────────────────────
+            # ── Step 2: Wait for OR window to fully close (9:40) ─────────────
             if now_et.hour < OR_END_HOUR or (now_et.hour == OR_END_HOUR and now_et.minute < OR_END_MIN):
                 return
 
-            # ── Step 2: Volatility check ─────────────────────────────────────
+            # ── Step 3: Volatility check ──────────────────────────────────────
             if state.bos is None and not state.skipped_vol:
-                or_valid, or_range_pct = or_range_is_valid(
+                or_valid, or_pct = or_range_is_valid(
                     state.opening_range.high, state.opening_range.low
                 )
                 if not or_valid:
                     state.skipped_vol = True
-                    logger.info(f"{symbol} | Skipped — OR too tight ({or_range_pct:.3f}%)")
+                    logger.info(f"{symbol} | Skipped — OR too tight ({or_pct:.3f}%)")
                     return
 
                 candles_1h = await get_candles(symbol, "1h")
@@ -125,79 +133,90 @@ class NitroScanner:
                     logger.info(f"{symbol} | Skipped — ATR compressed (ratio={atr_ratio:.2f})")
                     return
 
-                logger.info(f"{symbol} | Vol OK — OR={or_range_pct:.3f}%  ATR ratio={atr_ratio:.2f}")
+                logger.info(f"{symbol} | Vol OK — OR={or_pct:.3f}%  ATR={atr_ratio:.2f}")
 
-            # ── Step 3: Detect BOS ───────────────────────────────────────────
+            # ── Step 4: BOS detection ─────────────────────────────────────────
             if state.bos is None:
                 bos = detect_bos(candles_1m, state.opening_range.high, state.opening_range.low)
                 if bos:
                     state.bos = bos
-                    logger.info(f"{symbol} | BOS {bos.direction.upper()} @ {bos.bos_price:.2f}")
-                return
+                    logger.info(
+                        f"{symbol} | BOS {bos.direction.upper()} @ {bos.bos_price:.4f}  "
+                        f"candle H={bos.bos_candle_high:.4f} L={bos.bos_candle_low:.4f}"
+                    )
+                    # BOS just detected — fall through to entry below
+                else:
+                    return
 
-            # ── Step 4: Find best FVG after BOS ─────────────────────────────
-            candles_3m = await get_candles(symbol, "3m")
-            fvgs_1m = find_fvgs(candles_1m, state.bos.bos_candle_time, state.bos.direction, "1m")
-            fvgs_3m = find_fvgs(candles_3m, state.bos.bos_candle_time, state.bos.direction, "3m") \
-                      if not candles_3m.empty else []
-
-            best_fvg = get_best_fvg(fvgs_1m, fvgs_3m)
-            if not best_fvg:
-                return
-
-            state.active_fvg = best_fvg
-
-            # ── Step 5: Wait for retest on the FVG's timeframe ──────────────
-            current_price = float(candles_1m["Close"].iloc[-1])
-            if not is_retesting(current_price, best_fvg):
-                logger.debug(
-                    f"{symbol} | {best_fvg.timeframe} FVG awaiting retest "
-                    f"[price={current_price:.2f}  fvg={best_fvg.bottom:.2f}–{best_fvg.top:.2f}]"
+            # ── Step 5: [Crypto only] Coinalyze CVD confirmation ──────────────
+            if is_crypto(symbol):
+                from data.coinalyze_fetcher import get_cvd_confirmation
+                cvd_ok, buy_ratio = await get_cvd_confirmation(
+                    symbol, state.bos.direction, state.bos.bos_candle_time
                 )
+                if not cvd_ok:
+                    logger.info(
+                        f"{symbol} | BOS confirmed but CVD contra-flow "
+                        f"(buy_ratio={buy_ratio:.3f}) — skipping"
+                    )
+                    # Don't set alerted; re-check next scan in case we want to let it slide
+                    # Actually: one BOS per day, so skip it cleanly
+                    state.skipped_vol = True
+                    return
+
+            # ── Step 6: Compute entry / SL / TP ──────────────────────────────
+            entry = state.bos.bos_price
+            or_h  = state.opening_range.high
+            or_l  = state.opening_range.low
+
+            if state.bos.direction == "long":
+                sl   = or_h * (1 - SL_BUFFER_PCT)
+            else:
+                sl   = or_l * (1 + SL_BUFFER_PCT)
+
+            risk   = abs(entry - sl)
+            if risk <= 0:
+                logger.warning(f"{symbol} | Risk = 0 — skipping")
                 return
 
-            # ── Step 6: RR check ──────────
-            candles_1h = await get_candles(symbol, "1h")
-            tp = get_1h_tp(candles_1h, current_price, state.bos.direction)
-            if tp is None:
-                logger.info(f"{symbol} | Retest confirmed but no 1H TP level found")
-                return
+            if state.bos.direction == "long":
+                tp = entry + TARGET_R * risk
+            else:
+                tp = entry - TARGET_R * risk
 
-            rr = calculate_rr(current_price, best_fvg, tp, state.bos.direction)
-            if rr < MIN_RR:
-                logger.info(f"{symbol} | RR {rr:.1f} < {MIN_RR} min — skipping")
-                return
+            rr = round(abs(tp - entry) / risk, 2)
 
-            # ── ALL CONDITIONS MET ───────────────────────────────────────────
+            # 1H swing level as reference (shown in alert, not used for TP)
+            candles_1h  = await get_candles(symbol, "1h")
+            swing_level = get_1h_swing_level(candles_1h, entry, state.bos.direction)
+
+            # ── ALL CONDITIONS MET — fire alert ───────────────────────────────
             state.alerted = True
-            sl = best_fvg.bottom if state.bos.direction == "long" else best_fvg.top
 
             logger.info(
-                f"🚨 ALERT: {symbol} {state.bos.direction.upper()} "
-                f"entry={current_price:.2f}  sl={sl:.2f}  tp={tp:.2f}  rr={rr:.1f}R  "
-                f"FVG={best_fvg.timeframe}"
+                f"🚨 ENTRY: {symbol} {state.bos.direction.upper()} "
+                f"entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  rr={rr}R  "
+                f"swing={swing_level}"
             )
 
             await send_setup_alert(
                 symbol=symbol,
                 direction=state.bos.direction,
-                entry=current_price,
+                entry=entry,
                 sl=sl,
                 tp=tp,
-                fvg=best_fvg,
-                or_high=state.opening_range.high,
-                or_low=state.opening_range.low,
                 rr=rr,
+                or_high=or_h,
+                or_low=or_l,
+                swing_level=swing_level,
             )
 
-            # ── Paper trade entry ────────────────────────────────────────────
+            # ── Paper trade ───────────────────────────────────────────────────
             self._paper.open_trade(
                 symbol=symbol,
                 direction=state.bos.direction,
-                entry=current_price,
-                fvg_top=best_fvg.top,
-                fvg_bottom=best_fvg.bottom,
-                fvg_tf=best_fvg.timeframe,
+                entry=entry,
+                sl=sl,
                 tp=tp,
             )
 
@@ -205,14 +224,13 @@ class NitroScanner:
             logger.error(f"{symbol} | scan error: {e}", exc_info=True)
 
     async def _check_trade_outcome(self, symbol: str):
-        """Poll open trade for TP/SL hit using latest candle."""
         if not self._paper.already_in_trade(symbol):
             return
         try:
             candles = await get_candles(symbol, "1m")
             if candles.empty:
                 return
-            last = candles.iloc[-1]
+            last   = candles.iloc[-1]
             result = self._paper.check_and_close(
                 symbol,
                 current_high=float(last["High"]),
@@ -221,9 +239,7 @@ class NitroScanner:
             if result:
                 record_trade(result)
                 await send_outcome_alert(**result)
-                # Reset alerted flag to allow new setups on this symbol
-                state = self._states[symbol]
-                state.alerted = False
+                self._states[symbol].alerted = False
                 logger.info(f"{symbol} | Trade closed — ready for new setups")
         except Exception as e:
             logger.error(f"Trade outcome check error {symbol}: {e}")
